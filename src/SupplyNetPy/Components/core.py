@@ -1916,6 +1916,71 @@ class Node(NamedEntity, InfoMixin):
             raise ValueError("link.sink must match the node add_supplier_link is called on.")
         self.suppliers.append(link)
 
+    # ---- Supplier side of an order -----------------------------------------
+    #
+    # An order has two halves: the buyer decides to order, and the supplier
+    # handles it. The supplier half lives here, on the supplier node, so that it
+    # only ever touches the supplier's own stock and statistics. This is what
+    # lets a buyer and its supplier later run in separate processes (parallel
+    # simulation): the buyer never reads or writes the supplier's state
+    # directly, it only exchanges messages over the Link.
+
+    def receive_order(self, quantity, signal_drop=True):
+        """
+        Handle an incoming order on the supplier side, at the moment it arrives.
+
+        Books a shortage and a backorder if there is not enough stock right now,
+        and refuses the order if this node is disrupted. Otherwise it books the
+        demand and takes the units out of stock (waiting for stock if needed).
+
+        Parameters:
+            quantity (float): Number of units ordered.
+            signal_drop (bool): If True, wake this node's own replenishment
+                policy when the order creates a backorder.
+
+        Returns:
+            tuple or None: ``None`` if the order is refused (node disrupted).
+            Otherwise ``(get_event, batches)``: ``get_event`` fires when the
+            units have left the shelf; ``batches`` is the list of
+            ``(manufacture_date, quantity)`` for perishable goods (else empty).
+        """
+        if self.inventory.level < quantity:  # not enough stock: record shortage and backorder
+            self.stats.update_stats(shortage=[1, quantity - self.inventory.level], backorder=[1, quantity])
+            if signal_drop and not self.inventory_drop.triggered:
+                self.inventory_drop.succeed()  # a backorder was created, so let the replenishment policy check stock
+        if self.node_status != "active":
+            return None
+        self.stats.update_stats(demand_received=[1, quantity])
+        return self.inventory.get(quantity)
+
+    def serve_order(self, link, quantity, accepted, shipped, signal_drop=True):
+        """
+        Supplier-side process for an order sent over a link with a message delay.
+
+        Runs ``receive_order`` when the order arrives, sends the answer
+        (accepted or refused) back over the link, waits until the units have
+        left the shelf, and then sends the shipping notice back over the link.
+        Each message back takes ``link.message_delay`` time units to arrive.
+
+        Parameters:
+            link (Link): The link the order came in on.
+            quantity (float): Number of units ordered.
+            accepted (simpy.Event): Buyer's event; succeeds with True or False.
+            shipped (simpy.Event): Buyer's event; succeeds with the batch list
+                once the units have been shipped.
+            signal_drop (bool): Passed on to ``receive_order``.
+
+        Returns:
+            None
+        """
+        order = self.receive_order(quantity, signal_drop)
+        link.send(lambda: accepted.succeed(order is not None))
+        if order is None:
+            return
+        get_event, batches = order
+        yield get_event  # wait until the units have left the shelf
+        link.send(lambda: shipped.succeed(batches))
+
     # ---- Replenishment-policy contract -------------------------------------
     # The three methods below form the public contract that replenishment
     # policies (SSReplenishment, RQReplenishment, PeriodicReplenishment, and
@@ -2000,6 +2065,7 @@ class Link(NamedEntity, InfoMixin):
         link_failure_p (float): Probability of random link failure.
         link_disrupt_time (callable): Function returning time to next disruption.
         link_recovery_time (callable): Function returning recovery time after disruption.
+        message_delay (float): Time an order or a shipping notice takes to travel along the link.
 
     Attributes:
         env (simpy.Environment): Simulation environment.
@@ -2012,12 +2078,13 @@ class Link(NamedEntity, InfoMixin):
         status (str): Current status of the link ("active" or "inactive").
         link_disrupt_time (callable): Disruption time function.
         link_recovery_time (callable): Recovery time function.
+        message_delay (float): Time an order or a shipping notice takes to travel along the link.
 
     Functions:
         __init__: Initializes the link object and validates parameters.
         disruption: Simulates link disruption and automatic recovery.
     """
-    _info_keys = ["ID", "source", "sink", "cost", "lead_time", "link_failure_p"]
+    _info_keys = ["ID", "source", "sink", "cost", "lead_time", "link_failure_p", "message_delay"]
     _stats_keys = ["status"]
 
     def __init__(self, env: simpy.Environment,
@@ -2029,7 +2096,8 @@ class Link(NamedEntity, InfoMixin):
                  link_failure_p: float = 0.0,
                  link_disrupt_time: Callable = None,
                  link_recovery_time: Callable = lambda: 1,
-                 rng: random.Random = None) -> None:
+                 rng: random.Random = None,
+                 message_delay: float = 0) -> None:
         """
         Initialize the Link object representing a transportation connection between two nodes.
 
@@ -2043,6 +2111,11 @@ class Link(NamedEntity, InfoMixin):
             link_failure_p (float, optional): Probability of random link failure. Default is 0.0.
             link_disrupt_time (callable, optional): Function returning the time to the next disruption. If provided, overrides link_failure_p.
             link_recovery_time (callable, optional): Function returning the time required for link recovery after disruption. Default is a constant 1 unit.
+            message_delay (float, optional): Time an order takes to reach the supplier, and the
+                supplier's answer and shipping notice take to come back. Default 0: the supplier
+                sees the order at the same instant it is placed. A value above 0 models a
+                supplier that is "far away" in communication terms; it is also what lets the
+                two ends of the link run in separate processes in a parallel simulation.
 
         Attributes:
             env (simpy.Environment): The simulation environment.
@@ -2056,6 +2129,7 @@ class Link(NamedEntity, InfoMixin):
             status (str): Link status ("active" or "inactive").
             link_recovery_time (callable): Link recovery time function.
             link_disrupt_time (callable): Disruption time function.
+            message_delay (float): Message delay of the link.
 
         Returns:
             None
@@ -2084,6 +2158,7 @@ class Link(NamedEntity, InfoMixin):
             global_logger.error("Supplier node cannot be connected to a demand node.")
             raise ValueError("Supplier node cannot be connected to a demand node.")
         validate_non_negative("Cost", cost)
+        validate_non_negative("message_delay", message_delay)
         if (link_disrupt_time is not None):
             link_disrupt_time = ensure_numeric_callable("link_disrupt_time", link_disrupt_time)
         if (link_recovery_time is not None):
@@ -2101,6 +2176,7 @@ class Link(NamedEntity, InfoMixin):
         self.link_recovery_time = link_recovery_time  # link recovery time
         self.link_disrupt_time = link_disrupt_time  # link disruption time, if provided
         self.rng = rng if rng is not None else _rng  # RNG for probabilistic disruption; falls back to library default
+        self.message_delay = message_delay  # time an order or notice takes to travel along the link
 
         # Auto-register with the sink via the public method instead of mutating
         # sink.suppliers directly. Every Node initialises ``suppliers = []`` in
@@ -2166,6 +2242,28 @@ class Link(NamedEntity, InfoMixin):
             float: The source node's current inventory level.
         """
         return self.source.inventory.level
+
+    def send(self, deliver):
+        """
+        Send a message along this link: call ``deliver()`` after ``message_delay``.
+
+        With no delay the message arrives at once (``deliver()`` is called right
+        away). Otherwise a timer is started and ``deliver()`` runs when it fires.
+        Orders, answers and shipping notices between a buyer and its supplier
+        all go through here, so this is the single place that a parallel
+        simulation replaces to carry messages between processes.
+
+        Parameters:
+            deliver (callable): Zero-argument function that hands the message
+                to the receiving node.
+
+        Returns:
+            None
+        """
+        if not self.message_delay:
+            deliver()
+            return
+        self.env.timeout(self.message_delay).callbacks.append(lambda _: deliver())
 
 class Inventory(NamedEntity, InfoMixin):
     """
@@ -2898,21 +2996,39 @@ class InventoryNode(Node):
 
         self.pending_orders += 1  # count this order as in flight; decremented when delivery completes (or supplier disrupted)
 
-        if supplier.source.inventory.level < reorder_quantity:  # check if the supplier is able to fulfill the order, record shortage
-            shortage = reorder_quantity - supplier.source.inventory.level
-            supplier.source.stats.update_stats(shortage=[1,shortage], backorder=[1,reorder_quantity])
-            if(not supplier.source.inventory_drop.triggered):
-                supplier.source.inventory_drop.succeed()  # signal that inventory has been dropped (since backorder is created)
-
-        if(supplier.source.node_status == "active"):
-            self.stats.update_stats(demand_placed=[1,reorder_quantity],transportation_cost=supplier.cost)
-            supplier.source.stats.update_stats(demand_received=[1,reorder_quantity])
-
-            self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing inventory from supplier:{supplier.source.name}, order placed for {reorder_quantity} units.")
-            event, man_date_ls = supplier.source.inventory.get(reorder_quantity)
+        # Hand the order to the supplier. The supplier's own code
+        # (Node.receive_order) records any shortage, refuses the order if the
+        # supplier is disrupted, and takes the units off its shelf.
+        if not supplier.message_delay:
+            # The supplier sees the order at the same instant it is placed.
+            order = supplier.source.receive_order(reorder_quantity)
+            ok = order is not None
+            if ok:
+                self.stats.update_stats(demand_placed=[1,reorder_quantity],transportation_cost=supplier.cost)
+                self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing inventory from supplier:{supplier.source.name}, order placed for {reorder_quantity} units.")
+                event, man_date_ls = order
+                self.inventory.on_hand += reorder_quantity
+                yield event  # wait until the supplier has the units ready
+        else:
+            # The order takes `message_delay` to reach the supplier, and the
+            # supplier's answer and shipping notice each take `message_delay` to
+            # come back. Count the order in the inventory position (`on_hand`:
+            # units on the shelf plus units on the way) as soon as it is sent,
+            # so the policy does not order the same units again while waiting
+            # for the answer. It is taken back out if the supplier refuses.
             self.inventory.on_hand += reorder_quantity
-            yield event
+            answer, shipped = self.env.event(), self.env.event()
+            supplier.send(lambda: self.env.process(
+                supplier.source.serve_order(supplier, reorder_quantity, answer, shipped)))
+            ok = yield answer
+            if ok:
+                self.stats.update_stats(demand_placed=[1,reorder_quantity],transportation_cost=supplier.cost)
+                self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing inventory from supplier:{supplier.source.name}, order placed for {reorder_quantity} units.")
+                man_date_ls = yield shipped  # wait for the shipping notice
+            else:
+                self.inventory.on_hand -= reorder_quantity
 
+        if ok:
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:shipment in transit from supplier:{supplier.source.name}.") # log the shipment
             lead_time = supplier.lead_time() # get the lead time from the supplier
             validate_non_negative(name="lead_time", value=lead_time) # check if lead_time is non-negative
@@ -2998,7 +3114,8 @@ class InventoryNode(Node):
             # the node should be billed for, and credited with, only the units it
             # truly received.
             self.stats.update_stats(fulfillment_received=[1,accepted],inventory_spend_cost=accepted*self.buy_price)
-            supplier.source.stats.update_stats(demand_fulfilled=[1,accepted])
+            # Tell the supplier how many units were delivered (arrives after the link's message delay).
+            supplier.send(lambda n=accepted: supplier.source.stats.update_stats(demand_fulfilled=[1,n]))
         else:
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:Supplier:{supplier.source.name} is disrupted. Order not placed.")
         self.pending_orders -= 1
@@ -3282,22 +3399,48 @@ class Manufacturer(Node):
             yield self.env.timeout(1) # wait a tick before the policy retries
             return
 
-        if supplier.source.inventory.level < reorder_quantity:  # check if the supplier is able to fulfill the order, record shortage
-            shortage = reorder_quantity - supplier.source.inventory.level
-            supplier.source.stats.update_stats(shortage=[1,shortage], backorder=[1,reorder_quantity])
-
-        if(supplier.source.node_status == "active"): # check if the supplier is active and has enough inventory
-            if(self.raw_inventory_counts[raw_mat_id]>= reorder_quantity): # dont order if enough inventory is available (reorder_quantity depends on the number of product units that needs to be manufactured, there is no capcacity defined for raw material inventory)
+        if supplier.message_delay:
+            # The order and the supplier's replies each take `message_delay` to
+            # travel (see Link.send). The supplier's side of the order runs in
+            # Node.serve_order, so this node never touches the supplier's state.
+            # We check our own raw-material stock before sending, because once
+            # the order is on its way we cannot take it back.
+            if(self.raw_inventory_counts[raw_mat_id]>= reorder_quantity):
                 self.logger.info(f"{self.env.now:.4f}:{self.ID}:Sufficient raw material inventory for {supplier.source.raw_material.name}, no order placed. Current inventory level: {self.raw_inventory_counts}.")
                 self.ongoing_order_raw[raw_mat_id] = False
                 return
-
             self.pending_orders += 1  # count this raw-material order as in flight
-            self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing raw material:{supplier.source.raw_material.name} from supplier:{supplier.source.ID}, order placed for {reorder_quantity} units. Current inventory level: {self.raw_inventory_counts}.")
-            event, man_date_ls = supplier.source.inventory.get(reorder_quantity)
-            supplier.source.stats.update_stats(demand_received=[1,reorder_quantity]) # update the supplier statistics for demand received
-            yield event
+            answer, shipped = self.env.event(), self.env.event()
+            supplier.send(lambda: self.env.process(
+                supplier.source.serve_order(supplier, reorder_quantity, answer, shipped, signal_drop=False)))
+            ok = yield answer
+            if ok:
+                self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing raw material:{supplier.source.raw_material.name} from supplier:{supplier.source.ID}, order placed for {reorder_quantity} units. Current inventory level: {self.raw_inventory_counts}.")
+                yield shipped  # wait for the shipping notice
+            else:
+                self.pending_orders -= 1
+        else:
+            # The supplier sees the order at the same instant it is placed.
+            # Kept exactly as before, so results without a message delay do not
+            # change (note it books a supplier shortage even when we then find
+            # we have enough raw material and place no order).
+            if supplier.source.inventory.level < reorder_quantity:  # check if the supplier is able to fulfill the order, record shortage
+                shortage = reorder_quantity - supplier.source.inventory.level
+                supplier.source.stats.update_stats(shortage=[1,shortage], backorder=[1,reorder_quantity])
+            ok = supplier.source.node_status == "active"
+            if ok:
+                if(self.raw_inventory_counts[raw_mat_id]>= reorder_quantity): # dont order if enough inventory is available (reorder_quantity depends on the number of product units that needs to be manufactured, there is no capcacity defined for raw material inventory)
+                    self.logger.info(f"{self.env.now:.4f}:{self.ID}:Sufficient raw material inventory for {supplier.source.raw_material.name}, no order placed. Current inventory level: {self.raw_inventory_counts}.")
+                    self.ongoing_order_raw[raw_mat_id] = False
+                    return
 
+                self.pending_orders += 1  # count this raw-material order as in flight
+                self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing raw material:{supplier.source.raw_material.name} from supplier:{supplier.source.ID}, order placed for {reorder_quantity} units. Current inventory level: {self.raw_inventory_counts}.")
+                event, man_date_ls = supplier.source.inventory.get(reorder_quantity)
+                supplier.source.stats.update_stats(demand_received=[1,reorder_quantity]) # update the supplier statistics for demand received
+                yield event
+
+        if ok:
             self.stats.update_stats(demand_placed=[1,reorder_quantity],transportation_cost=supplier.cost)
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:shipment in transit from supplier:{supplier.source.name}.")
             lead_time = supplier.lead_time() # get the lead time from the supplier
@@ -3305,7 +3448,8 @@ class Manufacturer(Node):
             yield self.env.timeout(lead_time) # lead time for the order
 
             self.stats.update_stats(fulfillment_received=[1,reorder_quantity],inventory_spend_cost=reorder_quantity*supplier.source.sell_price)
-            supplier.source.stats.update_stats(demand_fulfilled=[1,reorder_quantity]) # update the supplier statistics for demand fulfilled
+            # Tell the supplier the order was delivered (arrives after the link's message delay).
+            supplier.send(lambda: supplier.source.stats.update_stats(demand_fulfilled=[1,reorder_quantity]))
             self.ongoing_order_raw[raw_mat_id] = False
             self.raw_inventory_counts[raw_mat_id] += reorder_quantity
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:Order received from supplier:{supplier.source.name}, inventory levels: {self.raw_inventory_counts}")

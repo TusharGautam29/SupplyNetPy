@@ -2400,3 +2400,83 @@ class TestLinkDisruptionProbabilisticIsTimePaced(unittest.TestCase):
         assert link.status == "active"
         env.run(until=3)
         assert link.status == "inactive"
+
+class TestLinkMessageDelay(unittest.TestCase):
+    """Link.message_delay: the order takes `d` to reach the supplier, and the
+    supplier's answer and shipping notice each take `d` to come back. With
+    d=3 and lead time 2, an order placed at t=0 lands at 0 + 3 + 3 + 2 = 8."""
+
+    def _build(self, delay):
+        env = simpy.Environment()
+        sup = scm.Supplier(env=env, ID="S1", name="S", node_type="infinite_supplier", logging=False)
+        dist = scm.InventoryNode(env=env, ID="D1", name="D", node_type="distributor",
+                                 capacity=150, initial_level=50, inventory_holding_cost=0.2,
+                                 replenishment_policy=scm.SSReplenishment,
+                                 policy_param={"s": 100, "S": 150},
+                                 product_buy_price=100, product_sell_price=105, logging=False)
+        link = scm.Link(env=env, ID="L1", source=sup, sink=dist, cost=5, lead_time=lambda: 2,
+                        message_delay=delay)
+        return env, sup, dist, link
+
+    def test_zero_delay_keeps_old_timing(self):
+        env, sup, dist, _ = self._build(0)
+        env.run(until=2.1)
+        assert dist.inventory.level == 150
+
+    def test_order_timeline_with_delay(self):
+        env, sup, dist, _ = self._build(3)
+        env.run(until=0.1)
+        assert dist.inventory.on_hand == 150, "order counts in inventory position as soon as it is sent"
+        assert dist.pending_orders == 1
+        env.run(until=2.9)
+        assert sup.stats.demand_received == [0, 0], "order has not reached the supplier yet"
+        env.run(until=3.1)
+        assert sup.stats.demand_received == [1, 100]
+        env.run(until=5.9)
+        assert dist.stats.demand_placed == [0, 0], "supplier's answer has not come back yet"
+        env.run(until=6.1)
+        assert dist.stats.demand_placed == [1, 100]
+        assert dist.stats.transportation_cost == 5
+        env.run(until=7.9)
+        assert dist.inventory.level == 50
+        env.run(until=8.1)
+        assert dist.inventory.level == 150
+        assert dist.pending_orders == 0
+        assert sup.stats.demand_fulfilled == [0, 0], "delivery notice still travelling to the supplier"
+        env.run(until=11.1)
+        assert sup.stats.demand_fulfilled == [1, 100]
+
+    def test_refused_order_is_taken_back_out(self):
+        env, sup, dist, _ = self._build(3)
+        sup.node_status = "inactive"  # supplier refuses when the order arrives at t=3
+        env.run(until=0.1)
+        assert dist.inventory.on_hand == 150
+        env.run(until=6.1)  # refusal arrives back at t=6
+        assert dist.inventory.on_hand == 50
+        assert dist.pending_orders == 0
+        assert dist.stats.demand_placed == [0, 0]
+        assert dist.stats.transportation_cost == 0
+        assert sup.stats.demand_received == [0, 0]
+
+    def test_raw_material_order_with_delay(self):
+        env = simpy.Environment()
+        rm = scm.RawMaterial(ID="RM1", name="RM", extraction_quantity=5, extraction_time=1, mining_cost=1, cost=5)
+        prod = scm.Product(ID="P1", name="P", manufacturing_cost=10, manufacturing_time=1,
+                           raw_materials=[(rm, 2)], sell_price=15, buy_price=5, batch_size=30)
+        sup = scm.Supplier(env=env, ID="S1", name="S", node_type="infinite_supplier", raw_material=rm, logging=False)
+        man = scm.Manufacturer(env=env, ID="M1", name="M", capacity=100, initial_level=50,
+                               inventory_holding_cost=0.5, replenishment_policy=scm.SSReplenishment,
+                               policy_param={"s": 60, "S": 100}, product_sell_price=10, product=prod,
+                               logging=False)
+        scm.Link(env=env, ID="L1", source=sup, sink=man, cost=1, lead_time=lambda: 2, message_delay=3)
+        env.run(until=3.1)
+        assert sup.stats.demand_received == [1, 100], "raw order (50 units x 2) reached the supplier at t=3"
+        env.run(until=7.9)
+        assert man.stats.fulfillment_received == [0, 0]
+        env.run(until=8.1)
+        assert man.stats.fulfillment_received == [1, 100]
+
+    def test_negative_delay_rejected(self):
+        env, sup, dist, _ = self._build(0)
+        with pytest.raises(ValueError):
+            scm.Link(env=env, ID="L2", source=sup, sink=dist, cost=1, lead_time=lambda: 1, message_delay=-1)
