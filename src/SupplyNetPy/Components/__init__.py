@@ -56,6 +56,11 @@ from SupplyNetPy.Components.utilities import (
     print_node_wise_performance,
     Network,
 )
+from SupplyNetPy.Components.parallel import (
+    partition_network,
+    check_partition,
+    build_partition,
+)
 
 __all__ = [
     # core — RNG
@@ -109,4 +114,8 @@ __all__ = [
     "format_node_wise_performance",
     "print_node_wise_performance",
     "Network",
+    # parallel (PDES partitioning)
+    "partition_network",
+    "check_partition",
+    "build_partition",
 ]

@@ -47,6 +47,21 @@ __all__ = [
 ]
 
 
+def _build_node(env, node):
+    """
+    Build one node object from its dict description (the ``node_type`` key
+    picks the class through ``_NODE_DISPATCH``). Shared by ``create_sc_net``
+    and the parallel-simulation partition builder so both build nodes the
+    same way.
+    """
+    cls, _, drop_node_type = _NODE_DISPATCH[NodeType(node["node_type"])]
+    # ``Manufacturer.__init__`` is the only constructor that does not accept
+    # ``node_type``, so for it we drop that key. The ``drop_node_type`` flag
+    # records this one difference.
+    kwargs = {k: v for k, v in node.items() if not (drop_node_type and k == "node_type")}
+    return cls(env=env, **kwargs)
+
+
 def check_duplicate_id(used_ids, new_id, entity_type="ID"):
     """
     Checks if ``new_id`` is already in ``used_ids``. If it is, logs an error
@@ -334,13 +349,8 @@ def create_sc_net(nodes: list, links: list, demands: list, env:simpy.Environment
                 used_ids.remove(node["ID"])
                 global_logger.error(f"Invalid node type {node['node_type']}")
                 raise ValueError("Invalid node type")
-            cls, counter_key, drop_node_type = _NODE_DISPATCH[nt]
-            # ``Manufacturer.__init__`` is the only constructor that does not
-            # accept ``node_type``, so for it we drop that key. The
-            # ``drop_node_type`` flag records this one difference.
-            kwargs = {k: v for k, v in node.items() if not (drop_node_type and k == "node_type")}
-            supplychainnet["nodes"][f"{node_id}"] = cls(env=env, **kwargs)
-            counters[counter_key] += 1
+            supplychainnet["nodes"][f"{node_id}"] = _build_node(env, node)
+            counters[_NODE_DISPATCH[nt][1]] += 1
         elif isinstance(node, Node):
             check_duplicate_id(used_ids, node.ID, "node ID")
             node_id = node.ID
