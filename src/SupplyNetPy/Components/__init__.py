@@ -60,6 +60,8 @@ from SupplyNetPy.Components.parallel import (
     partition_network,
     check_partition,
     build_partition,
+    run_parallel,
+    simulate_sc_net_parallel,
 )
 
 __all__ = [
@@ -114,8 +116,10 @@ __all__ = [
     "format_node_wise_performance",
     "print_node_wise_performance",
     "Network",
-    # parallel (PDES partitioning)
+    # parallel (PDES partitioning and runner)
     "partition_network",
     "check_partition",
     "build_partition",
+    "run_parallel",
+    "simulate_sc_net_parallel",
 ]

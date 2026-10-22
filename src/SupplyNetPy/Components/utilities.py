@@ -1,6 +1,4 @@
 import simpy
-import networkx as nx
-import matplotlib.pyplot as plt
 # Import only the names we need (no ``*`` wildcard imports). ``global_logger``
 # is an internal helper, so we pull it in by name here instead of making it
 # part of the public API.
@@ -157,6 +155,11 @@ def visualize_sc_net(supplychainnet):
     Returns:
         None
     """
+    # Imported here, not at the top: loading these two takes most of a second,
+    # and only drawing needs them (parallel runs start one process per piece).
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
     G = nx.DiGraph()
     nodes = supplychainnet["nodes"]
     edges = supplychainnet["links"]
@@ -409,6 +412,114 @@ def create_sc_net(nodes: list, links: list, demands: list, env:simpy.Environment
     supplychainnet.update(counters)
     return supplychainnet
 
+def _node_summary(node):
+    """
+    What the network totals need from one node (or demand) after a run, as plain data.
+
+    Plain data can be sent back from another process, so a parallel run builds
+    these summaries inside each process and adds them up in the main one.
+    """
+    node.stats.update_stats()  # bring costs and revenue up to date
+    inventory = getattr(node, "inventory", None)
+    summary = {"stats": node.stats.get_statistics()}
+    if inventory is not None:
+        levels = inventory.instantaneous_levels
+        summary["level"] = inventory.level
+        summary["avg_level"] = sum([x[1] for x in levels]) / len(levels) if len(levels) > 0 else 0
+        summary["carry_cost"] = inventory.carry_cost
+    return summary
+
+def _fill_network_kpis(supplychainnet, node_summaries, demand_summaries):
+    """Add up the per-node summaries (from ``_node_summary``) into the network totals."""
+    # Let's create some variables to store stats
+    total_available_inv = 0
+    avg_available_inv = 0
+    total_inv_carry_cost = 0
+    total_inv_spend = 0
+    total_inv_waste = 0
+    total_transport_cost = 0
+    total_revenue = 0
+    total_cost = 0
+    total_profit = 0
+    total_demand_by_customers = [0, 0] # [orders, products]
+    total_fulfillment_received_by_customers = [0, 0] # [orders, products]
+    total_demand_by_site = [0, 0] # [orders, products]
+    total_fulfillment_received_by_site = [0, 0] # [orders, products]
+    total_demand_placed = [0, 0] # [orders, products]
+    total_fulfillment_received = [0, 0] # [orders, products]
+    total_shortage = [0, 0] # [orders, products]
+    total_backorders = [0, 0] # [orders, products]
+    
+    for summary in node_summaries:
+        stats = summary["stats"]
+        total_available_inv += summary["level"]
+        avg_available_inv += summary["avg_level"]
+        total_inv_carry_cost += summary["carry_cost"]
+        total_inv_spend += stats["inventory_spend_cost"]
+        total_inv_waste += stats["inventory_waste"]
+        total_transport_cost += stats["transportation_cost"]
+        total_cost += stats["node_cost"]
+        total_revenue += stats["revenue"]
+        total_demand_by_site[0] += stats["demand_placed"][0]
+        total_demand_by_site[1] += stats["demand_placed"][1]
+        total_fulfillment_received_by_site[0] += stats["fulfillment_received"][0]
+        total_fulfillment_received_by_site[1] += stats["fulfillment_received"][1]
+        total_shortage[0] += stats["shortage"][0]
+        total_shortage[1] += stats["shortage"][1]
+        total_backorders[0] += stats["backorder"][0]
+        total_backorders[1] += stats["backorder"][1]
+    for summary in demand_summaries:
+        stats = summary["stats"]
+        total_transport_cost += stats["transportation_cost"]
+        total_cost += stats["node_cost"]
+        total_revenue += stats["revenue"]
+        total_demand_by_customers[0] += stats["demand_placed"][0] # orders
+        total_demand_by_customers[1] += stats["demand_placed"][1] # products
+        total_fulfillment_received_by_customers[0] += stats["fulfillment_received"][0]
+        total_fulfillment_received_by_customers[1] += stats["fulfillment_received"][1]
+        total_shortage[0] += stats["shortage"][0]
+        total_shortage[1] += stats["shortage"][1]
+        total_backorders[0] += stats["backorder"][0]
+        total_backorders[1] += stats["backorder"][1]
+    total_demand_placed[0] = total_demand_by_customers[0] + total_demand_by_site[0]
+    total_demand_placed[1] = total_demand_by_customers[1] + total_demand_by_site[1]
+    total_fulfillment_received[0] = total_fulfillment_received_by_customers[0] + total_fulfillment_received_by_site[0]
+    total_fulfillment_received[1] = total_fulfillment_received_by_customers[1] + total_fulfillment_received_by_site[1]
+    total_profit = total_revenue - total_cost
+    supplychainnet["available_inv"] = total_available_inv
+    supplychainnet["avg_available_inv"] = avg_available_inv
+    supplychainnet["inventory_carry_cost"] = total_inv_carry_cost   
+    supplychainnet["inventory_spend_cost"] = total_inv_spend
+    supplychainnet["inventory_waste"] = total_inv_waste
+    supplychainnet["transportation_cost"] = total_transport_cost
+    supplychainnet["revenue"] = total_revenue
+    supplychainnet["total_cost"] = total_cost
+    supplychainnet["profit"] = total_profit
+    supplychainnet["demand_by_customers"] = total_demand_by_customers
+    supplychainnet["fulfillment_received_by_customers"] = total_fulfillment_received_by_customers
+    supplychainnet["demand_by_site"] = total_demand_by_site
+    supplychainnet["fulfillment_received_by_site"] = total_fulfillment_received_by_site
+    supplychainnet["total_demand"] = total_demand_placed
+    supplychainnet["total_fulfillment_received"] = total_fulfillment_received
+    supplychainnet["shortage"] = total_shortage
+    supplychainnet["backorders"] = total_backorders
+    # Calculate average cost per order and per item
+    if total_demand_placed[0] > 0:
+        supplychainnet["avg_cost_per_order"] = total_cost / total_demand_placed[0]
+    else:
+        supplychainnet["avg_cost_per_order"] = 0
+    if total_demand_placed[1] > 0:
+        supplychainnet["avg_cost_per_item"] = total_cost / total_demand_placed[1]
+    else:
+        supplychainnet["avg_cost_per_item"] = 0
+
+def _log_network_kpis(supplychainnet):
+    logger = global_logger
+    max_key_length = max(len(key) for key in supplychainnet.keys()) + 1
+    logger.info(f"Supply chain info:")
+    for key in sorted(supplychainnet.keys()):
+        logger.info(f"{key.ljust(max_key_length)}: {supplychainnet[key]}")
+
 def simulate_sc_net(supplychainnet, sim_time, logging=True, log_window=None):
     """
     Simulate the supply chain network for a given time period, and calculate performance measures.
@@ -465,96 +576,13 @@ def simulate_sc_net(supplychainnet, sim_time, logging=True, log_window=None):
         global_logger.disable_logging()
         env.run(sim_time) # Run the simulation
 
-    # Let's create some variables to store stats
-    total_available_inv = 0
-    avg_available_inv = 0
-    total_inv_carry_cost = 0
-    total_inv_spend = 0
-    total_inv_waste = 0
-    total_transport_cost = 0
-    total_revenue = 0
-    total_cost = 0
-    total_profit = 0
-    total_demand_by_customers = [0, 0] # [orders, products]
-    total_fulfillment_received_by_customers = [0, 0] # [orders, products]
-    total_demand_by_site = [0, 0] # [orders, products]
-    total_fulfillment_received_by_site = [0, 0] # [orders, products]
-    total_demand_placed = [0, 0] # [orders, products]
-    total_fulfillment_received = [0, 0] # [orders, products]
-    total_shortage = [0, 0] # [orders, products]
-    total_backorders = [0, 0] # [orders, products]
-    
-    for key, node in supplychainnet["nodes"].items():
-        if(node.node_type == NodeType.INFINITE_SUPPLIER): # skip infinite suppliers
-            continue
-        node.stats.update_stats() # update stats for the node
-        total_available_inv += node.inventory.level
-        if len(node.inventory.instantaneous_levels)>0:
-            avg_available_inv += sum([x[1] for x in node.inventory.instantaneous_levels])/len(node.inventory.instantaneous_levels) 
-        total_inv_carry_cost += node.inventory.carry_cost
-        total_inv_spend += node.stats.inventory_spend_cost
-        total_inv_waste += node.stats.inventory_waste
-        total_transport_cost += node.stats.transportation_cost
-        total_cost += node.stats.node_cost
-        total_revenue += node.stats.revenue
-        total_demand_by_site[0] += node.stats.demand_placed[0]
-        total_demand_by_site[1] += node.stats.demand_placed[1]
-        total_fulfillment_received_by_site[0] += node.stats.fulfillment_received[0]
-        total_fulfillment_received_by_site[1] += node.stats.fulfillment_received[1]
-        total_shortage[0] += node.stats.shortage[0]
-        total_shortage[1] += node.stats.shortage[1]
-        total_backorders[0] += node.stats.backorder[0]
-        total_backorders[1] += node.stats.backorder[1]
-    for key, node in supplychainnet["demands"].items():
-        node.stats.update_stats() # update stats for the node
-        total_transport_cost += node.stats.transportation_cost
-        total_cost += node.stats.node_cost
-        total_revenue += node.stats.revenue
-        total_demand_by_customers[0] += node.stats.demand_placed[0] # orders
-        total_demand_by_customers[1] += node.stats.demand_placed[1] # products
-        total_fulfillment_received_by_customers[0] += node.stats.fulfillment_received[0]
-        total_fulfillment_received_by_customers[1] += node.stats.fulfillment_received[1]
-        total_shortage[0] += node.stats.shortage[0]
-        total_shortage[1] += node.stats.shortage[1]
-        total_backorders[0] += node.stats.backorder[0]
-        total_backorders[1] += node.stats.backorder[1]
-    total_demand_placed[0] = total_demand_by_customers[0] + total_demand_by_site[0]
-    total_demand_placed[1] = total_demand_by_customers[1] + total_demand_by_site[1]
-    total_fulfillment_received[0] = total_fulfillment_received_by_customers[0] + total_fulfillment_received_by_site[0]
-    total_fulfillment_received[1] = total_fulfillment_received_by_customers[1] + total_fulfillment_received_by_site[1]
-    total_profit = total_revenue - total_cost
-    supplychainnet["available_inv"] = total_available_inv
-    supplychainnet["avg_available_inv"] = avg_available_inv
-    supplychainnet["inventory_carry_cost"] = total_inv_carry_cost   
-    supplychainnet["inventory_spend_cost"] = total_inv_spend
-    supplychainnet["inventory_waste"] = total_inv_waste
-    supplychainnet["transportation_cost"] = total_transport_cost
-    supplychainnet["revenue"] = total_revenue
-    supplychainnet["total_cost"] = total_cost
-    supplychainnet["profit"] = total_profit
-    supplychainnet["demand_by_customers"] = total_demand_by_customers
-    supplychainnet["fulfillment_received_by_customers"] = total_fulfillment_received_by_customers
-    supplychainnet["demand_by_site"] = total_demand_by_site
-    supplychainnet["fulfillment_received_by_site"] = total_fulfillment_received_by_site
-    supplychainnet["total_demand"] = total_demand_placed
-    supplychainnet["total_fulfillment_received"] = total_fulfillment_received
-    supplychainnet["shortage"] = total_shortage
-    supplychainnet["backorders"] = total_backorders
-    # Calculate average cost per order and per item
-    if total_demand_placed[0] > 0:
-        supplychainnet["avg_cost_per_order"] = total_cost / total_demand_placed[0]
-    else:
-        supplychainnet["avg_cost_per_order"] = 0
-    if total_demand_placed[1] > 0:
-        supplychainnet["avg_cost_per_item"] = total_cost / total_demand_placed[1]
-    else:
-        supplychainnet["avg_cost_per_item"] = 0
+    node_summaries = [_node_summary(node) for node in supplychainnet["nodes"].values()
+                      if node.node_type != NodeType.INFINITE_SUPPLIER]  # infinite suppliers are left out
+    demand_summaries = [_node_summary(demand) for demand in supplychainnet["demands"].values()]
+    _fill_network_kpis(supplychainnet, node_summaries, demand_summaries)
     if log_window is not None:
         global_logger.enable_logging()
-    max_key_length = max(len(key) for key in supplychainnet.keys()) + 1
-    logger.info(f"Supply chain info:")
-    for key in sorted(supplychainnet.keys()):
-        logger.info(f"{key.ljust(max_key_length)}: {supplychainnet[key]}")
+    _log_network_kpis(supplychainnet)
     return supplychainnet
 
 def get_node_wise_performance(nodes_object_list):

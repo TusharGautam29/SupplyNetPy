@@ -2046,6 +2046,21 @@ class Node(NamedEntity, InfoMixin):
         yield self.inventory_drop
         self.inventory_drop = self.env.event()
 
+def _deliver_at(env, delay, deliver):
+    """
+    Call ``deliver()`` after ``delay``, before the other events of that instant.
+
+    Messages between nodes are delivered "first thing" at their arrival time
+    (SimPy's URGENT priority). A parallel run hands messages from other
+    processes over at the same priority, so the order of events inside one
+    instant is the same whether the network runs in one process or in many.
+    """
+    event = simpy.Event(env)
+    event._ok, event._value = True, None  # an already-succeeded event, like SimPy's own run(until=...) marker
+    event.callbacks.append(lambda _: deliver())
+    env.schedule(event, priority=simpy.core.URGENT, delay=delay)
+    return event
+
 class Link(NamedEntity, InfoMixin):
     """
     Represents a transportation connection between two nodes in the supply network.
@@ -2250,8 +2265,8 @@ class Link(NamedEntity, InfoMixin):
         With no delay the message arrives at once (``deliver()`` is called right
         away). Otherwise a timer is started and ``deliver()`` runs when it fires.
         Orders, answers and shipping notices between a buyer and its supplier
-        all go through here, so this is the single place that a parallel
-        simulation replaces to carry messages between processes.
+        all go through here. A message arrives before the other events of its
+        arrival instant (see ``_deliver_at``).
 
         Parameters:
             deliver (callable): Zero-argument function that hands the message
@@ -2263,7 +2278,39 @@ class Link(NamedEntity, InfoMixin):
         if not self.message_delay:
             deliver()
             return
-        self.env.timeout(self.message_delay).callbacks.append(lambda _: deliver())
+        _deliver_at(self.env, self.message_delay, deliver)
+
+    # The two messages a buyer sends to its supplier. They are named methods
+    # (not inline lambdas at the call sites) so a parallel run can replace them
+    # with ones that send plain data to another process.
+
+    def send_order(self, quantity, accepted, shipped, signal_drop=True):
+        """
+        Send an order to the supplier; it is handled by ``Node.serve_order`` on arrival.
+
+        Parameters:
+            quantity (float): Number of units ordered.
+            accepted (simpy.Event): Buyer's event; succeeds with True or False.
+            shipped (simpy.Event): Buyer's event; succeeds with the batch list once shipped.
+            signal_drop (bool): Passed on to ``Node.serve_order``.
+
+        Returns:
+            None
+        """
+        self.send(lambda: self.env.process(
+            self.source.serve_order(self, quantity, accepted, shipped, signal_drop)))
+
+    def send_delivered(self, quantity):
+        """
+        Tell the supplier that ``quantity`` units were delivered (books its ``demand_fulfilled``).
+
+        Parameters:
+            quantity (float): Number of units that reached the buyer.
+
+        Returns:
+            None
+        """
+        self.send(lambda: self.source.stats.update_stats(demand_fulfilled=[1, quantity]))
 
 class Inventory(NamedEntity, InfoMixin):
     """
@@ -3018,8 +3065,7 @@ class InventoryNode(Node):
             # for the answer. It is taken back out if the supplier refuses.
             self.inventory.on_hand += reorder_quantity
             answer, shipped = self.env.event(), self.env.event()
-            supplier.send(lambda: self.env.process(
-                supplier.source.serve_order(supplier, reorder_quantity, answer, shipped)))
+            supplier.send_order(reorder_quantity, answer, shipped)
             ok = yield answer
             if ok:
                 self.stats.update_stats(demand_placed=[1,reorder_quantity],transportation_cost=supplier.cost)
@@ -3115,7 +3161,7 @@ class InventoryNode(Node):
             # truly received.
             self.stats.update_stats(fulfillment_received=[1,accepted],inventory_spend_cost=accepted*self.buy_price)
             # Tell the supplier how many units were delivered (arrives after the link's message delay).
-            supplier.send(lambda n=accepted: supplier.source.stats.update_stats(demand_fulfilled=[1,n]))
+            supplier.send_delivered(accepted)
         else:
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:Supplier:{supplier.source.name} is disrupted. Order not placed.")
         self.pending_orders -= 1
@@ -3411,8 +3457,7 @@ class Manufacturer(Node):
                 return
             self.pending_orders += 1  # count this raw-material order as in flight
             answer, shipped = self.env.event(), self.env.event()
-            supplier.send(lambda: self.env.process(
-                supplier.source.serve_order(supplier, reorder_quantity, answer, shipped, signal_drop=False)))
+            supplier.send_order(reorder_quantity, answer, shipped, signal_drop=False)
             ok = yield answer
             if ok:
                 self.logger.info(f"{self.env.now:.4f}:{self.ID}:Replenishing raw material:{supplier.source.raw_material.name} from supplier:{supplier.source.ID}, order placed for {reorder_quantity} units. Current inventory level: {self.raw_inventory_counts}.")
@@ -3449,7 +3494,7 @@ class Manufacturer(Node):
 
             self.stats.update_stats(fulfillment_received=[1,reorder_quantity],inventory_spend_cost=reorder_quantity*supplier.source.sell_price)
             # Tell the supplier the order was delivered (arrives after the link's message delay).
-            supplier.send(lambda: supplier.source.stats.update_stats(demand_fulfilled=[1,reorder_quantity]))
+            supplier.send_delivered(reorder_quantity)
             self.ongoing_order_raw[raw_mat_id] = False
             self.raw_inventory_counts[raw_mat_id] += reorder_quantity
             self.logger.info(f"{self.env.now:.4f}:{self.ID}:Order received from supplier:{supplier.source.name}, inventory levels: {self.raw_inventory_counts}")

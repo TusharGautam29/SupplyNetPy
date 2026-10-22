@@ -2,7 +2,7 @@ import pytest
 import simpy
 
 import SupplyNetPy.Components as scm
-from SupplyNetPy.Components.parallel import RemoteNode
+from SupplyNetPy.Components.parallel import RemoteNode, _with_delays
 
 
 def _small_net():
@@ -175,3 +175,114 @@ class TestBuildPartition:
         whole["env"].run(until=60)
         for nid, node in serial["nodes"].items():
             assert whole["nodes"][nid].stats.get_statistics() == node.stats.get_statistics(), nid
+
+
+def _chain_net():
+    """Supplier -> manufacturer -> distributor -> two shops, every link delayed.
+    Small stocks so orders often wait for stock (shortages and backorders)."""
+    rm = scm.RawMaterial(ID="RM", name="raw", extraction_quantity=40, extraction_time=1, mining_cost=1, cost=2)
+    prod = scm.Product(ID="P", name="prod", manufacturing_cost=3, manufacturing_time=1,
+                       raw_materials=[(rm, 2)], sell_price=12, buy_price=6, batch_size=40)
+    nodes = [
+        {"ID": "S", "name": "S", "node_type": "supplier", "raw_material": rm, "capacity": 600, "initial_level": 300},
+        {"ID": "M", "name": "M", "node_type": "manufacturer", "capacity": 200, "initial_level": 60,
+         "inventory_holding_cost": 0.2, "replenishment_policy": scm.SSReplenishment,
+         "policy_param": {"s": 80, "S": 200}, "product_sell_price": 12, "product": prod},
+        {"ID": "D", "name": "D", "node_type": "distributor", "capacity": 120, "initial_level": 60,
+         "inventory_holding_cost": 0.1, "replenishment_policy": scm.SSReplenishment,
+         "policy_param": {"s": 50, "S": 120}, "product_buy_price": 12, "product_sell_price": 15},
+    ]
+    for r in ("R0", "R1"):
+        nodes.append({"ID": r, "name": r, "node_type": "retailer", "capacity": 40, "initial_level": 20,
+                      "inventory_holding_cost": 0.3, "replenishment_policy": scm.SSReplenishment,
+                      "policy_param": {"s": 15, "S": 40}, "product_buy_price": 15, "product_sell_price": 20})
+    links = [
+        {"ID": "L_S_M", "source": "S", "sink": "M", "cost": 1, "lead_time": lambda: 1.5, "message_delay": 1},
+        {"ID": "L_M_D", "source": "M", "sink": "D", "cost": 2, "lead_time": lambda: 2, "message_delay": 1.5},
+        {"ID": "L_D_R0", "source": "D", "sink": "R0", "cost": 1, "lead_time": lambda: 1, "message_delay": 1},
+        {"ID": "L_D_R1", "source": "D", "sink": "R1", "cost": 1, "lead_time": lambda: 0.5, "message_delay": 1.25},
+    ]
+    demands = [
+        {"ID": "d_R0", "name": "d_R0", "order_arrival_model": lambda: 0.7, "order_quantity_model": lambda: 4, "demand_node": "R0"},
+        {"ID": "d_R1", "name": "d_R1", "order_arrival_model": lambda: 1.3, "order_quantity_model": lambda: 6, "demand_node": "R1"},
+    ]
+    return nodes, links, demands
+
+
+def _chain_no_delay():
+    nodes, links, demands = _chain_net()
+    return nodes, [{k: v for k, v in l.items() if k != "message_delay"} for l in links], demands
+
+
+def _serial_stats(factory, sim_time):
+    net = scm.create_sc_net(*factory())
+    net["env"].run(until=sim_time)
+    return {nid: node.stats.get_statistics() for nid, node in net["nodes"].items()}
+
+
+class TestRunParallel:
+    """A parallel run of a network without randomness must give exactly the
+    same statistics as the one-process run with the same message delays."""
+
+    CHAIN_SPLIT = {"S": 0, "M": 1, "D": 2, "R0": 0, "R1": 1}  # every link is cut
+
+    def test_every_link_cut_matches_serial(self):
+        serial = _serial_stats(_chain_net, 80)
+        result = scm.run_parallel(_chain_net, 80, assignment=self.CHAIN_SPLIT, processes=False)
+        assert result["lookahead"] == 1 and result["windows"] == 80
+        assert result["stats"] == serial
+        assert serial["D"]["shortage"][0] > 0, "the test network should make orders wait for stock"
+
+    def test_mixed_delays_with_integer_times_matches_serial(self):
+        serial = _serial_stats(_small_net, 60)
+        result = scm.run_parallel(_small_net, 60, assignment=TestBuildPartition.ASSIGN, processes=False)
+        assert result["stats"] == serial
+
+    def test_separate_processes_match_serial(self):
+        serial = _serial_stats(_chain_net, 80)
+        result = scm.run_parallel(_chain_net, 80, assignment=self.CHAIN_SPLIT)
+        assert result["stats"] == serial
+
+    def test_partitioner_split_and_one_piece(self):
+        serial = _serial_stats(_chain_net, 50)
+        assert scm.run_parallel(_chain_net, 50, n_parts=2, processes=False)["stats"] == serial
+        one = scm.run_parallel(_chain_net, 50, n_parts=1, processes=False)
+        assert one["windows"] == 1 and one["stats"] == serial
+
+    def test_needs_n_parts_or_assignment(self):
+        with pytest.raises(ValueError, match="n_parts"):
+            scm.run_parallel(_chain_net, 10)
+
+    def test_network_totals_match_simulate_sc_net(self):
+        serial = scm.simulate_sc_net(scm.create_sc_net(*_chain_net()), 80, logging=False)
+        par = scm.simulate_sc_net_parallel(_chain_net, 80, assignment=self.CHAIN_SPLIT,
+                                           processes=False, logging=False)
+        kpis = [k for k in serial if k not in ("nodes", "links", "demands", "env")]
+        assert {k: par[k] for k in kpis} == {k: serial[k] for k in kpis}
+        assert serial["profit"] != 0
+        for nid, node in serial["nodes"].items():
+            assert par["nodes"][nid].stats.get_statistics() == node.stats.get_statistics(), nid
+        for did, demand in serial["demands"].items():
+            assert par["demands"][did].stats.get_statistics() == demand.stats.get_statistics(), did
+        assert par["parallel"]["cut_links"] == ["L_S_M", "L_M_D", "L_D_R0", "L_D_R1"]
+
+    def test_cut_delay_goes_only_on_cut_links(self):
+        par = scm.simulate_sc_net_parallel(_chain_no_delay, 60, n_parts=2, cut_delay=1,
+                                           processes=False, logging=False)
+        cut = par["parallel"]["cut_links"]
+        assert cut and par["parallel"]["lookahead"] == 1
+        for lid, link in par["links"].items():
+            assert link.message_delay == (1 if lid in cut else 0), lid
+        serial = scm.simulate_sc_net(
+            scm.create_sc_net(*_with_delays(_chain_no_delay, {lid: 1 for lid in cut})), 60, logging=False)
+        assert par["profit"] == serial["profit"] and par["shortage"] == serial["shortage"]
+
+    def test_cut_delay_must_be_positive(self):
+        with pytest.raises(ValueError, match="cut_delay"):
+            scm.simulate_sc_net_parallel(_chain_no_delay, 10, n_parts=2, cut_delay=0)
+
+    def test_cut_link_outside_the_runner_refuses_orders(self):
+        nodes, links, demands = _small_net()
+        p0 = scm.build_partition(nodes, links, demands, TestBuildPartition.ASSIGN, 0)
+        with pytest.raises(RuntimeError, match="run_parallel"):
+            p0["links"]["L_D1_R1"].send_delivered(1)

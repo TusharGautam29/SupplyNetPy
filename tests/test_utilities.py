@@ -118,7 +118,8 @@ def test_process_info_dict_logs_and_returns(monkeypatch):
 
 def test_visualize_sc_net_runs(monkeypatch):
     # Patch plt.show to avoid opening a window
-    monkeypatch.setattr(utilities.plt, "show", lambda: None)
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(plt, "show", lambda: None)
     nodes = {"N1": DummyNode("N1", "supplier"), "N2": DummyNode("N2", "retailer")}
     links = {"L1": DummyLink("L1", nodes["N1"], nodes["N2"])}
     scnet = {"nodes": nodes, "links": links}
